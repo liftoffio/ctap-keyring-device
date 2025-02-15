@@ -23,6 +23,7 @@ from fido2.webauthn import (
     PublicKeyCredentialDescriptor,
     PublicKeyCredentialType,
     PublicKeyCredentialUserEntity,
+    AuthenticatorTransport,
 )
 from keyring.backends.fail import Keyring as FailKeyring
 
@@ -73,10 +74,10 @@ class CtapKeyringDevice(ctap.CtapDevice):
 
     def __init__(self):
         self._ctap2_cmd_to_handler = {
-            ctap2.Ctap2.CMD.MAKE_CREDENTIAL: self.make_credential,
-            ctap2.Ctap2.CMD.GET_ASSERTION: self.get_assertion,
-            ctap2.Ctap2.CMD.GET_NEXT_ASSERTION: self.get_next_assertion,
-            ctap2.Ctap2.CMD.GET_INFO: self.get_info,
+            Ctap2.CMD.MAKE_CREDENTIAL: self.make_credential,
+            Ctap2.CMD.GET_ASSERTION: self.get_assertion,
+            Ctap2.CMD.GET_NEXT_ASSERTION: self.get_next_assertion,
+            Ctap2.CMD.GET_INFO: self.get_info,
         }
 
         self._info = Info(
@@ -84,15 +85,15 @@ class CtapKeyringDevice(ctap.CtapDevice):
             extensions=[],
             aaguid=self.AAGUID,
             options={
-                CtapOptions.PLATFORM_DEVICE: True,
-                CtapOptions.RESIDENT_KEY: True,
-                CtapOptions.USER_PRESENCE: True,
-                CtapOptions.USER_VERIFICATION: True,
-                CtapOptions.CLIENT_PIN: True,
+                'plat': True,
+                'rk': True,
+                'up': True,
+                'uv': True,
+                'clientPin': True,
             },
-            pin_uv_protocols=[ctap2.PinProtocolV2.VERSION],
+            pin_uv_protocols=[PinProtocolV2.VERSION],
             max_msg_size=self.MAX_MSG_SIZE,
-            transports=[webauthn.AuthenticatorTransport.INTERNAL],
+            transports=[AuthenticatorTransport.INTERNAL],
             algorithms=cose.CoseKey.supported_algorithms(),
         )
 
@@ -117,7 +118,6 @@ class CtapKeyringDevice(ctap.CtapDevice):
         event: Event = None,
         on_keepalive: FunctionType = None,
     ):
-        # noinspection PyBroadException
         try:
             res = self._call(cmd, data, event, on_keepalive)
             return self._wrap_err_code(CtapError.ERR.SUCCESS) + cbor.encode(res)
@@ -126,7 +126,6 @@ class CtapKeyringDevice(ctap.CtapDevice):
         except Exception:
             return self._wrap_err_code(CtapError.ERR.OTHER)
 
-    # noinspection PyUnusedLocal
     def _call(
         self,
         cmd: int,
@@ -134,13 +133,13 @@ class CtapKeyringDevice(ctap.CtapDevice):
         event: Event = None,
         on_keepalive: FunctionType = None,
     ):
-        if cmd != hid.CTAPHID.CBOR:
+        if cmd != 0x10:  # CTAPHID.CBOR
             raise CtapError(CtapError.ERR.INVALID_COMMAND)
 
         if not data:
             raise CtapError(CtapError.ERR.INVALID_PARAMETER)
 
-        ctap2_cmd = ctap2.Ctap2.CMD.from_bytes(data[:1], 'big')
+        ctap2_cmd = int.from_bytes(data[:1], 'big')
         handler = self._ctap2_cmd_to_handler.get(ctap2_cmd)
         if not handler:
             raise CtapError(CtapError.ERR.INVALID_COMMAND)
@@ -168,7 +167,6 @@ class CtapKeyringDevice(ctap.CtapDevice):
         return self._info
 
     def make_credential(self, make_credential_request: dict) -> AttestationResponse:
-        # noinspection PyBroadException
         request = CtapMakeCredentialRequest.create(make_credential_request)
         if (
             not request.rp
@@ -192,10 +190,11 @@ class CtapKeyringDevice(ctap.CtapDevice):
         )
 
         attestation_statement = {'alg': cred.algorithm, 'sig': signature}
-        attestation_response = AttestationResponse(
-            PackedAttestation.FORMAT, authenticator_data, attestation_statement
+        return AttestationResponse(
+            fmt='packed',
+            auth_data=authenticator_data,
+            att_stmt=attestation_statement
         )
-        return attestation_response
 
     @classmethod
     def _create_credential(cls, request: CtapMakeCredentialRequest) -> Credential:
@@ -238,15 +237,20 @@ class CtapKeyringDevice(ctap.CtapDevice):
         self, rp_id: str, attested_credential_data: Optional[AttestedCredentialData]
     ) -> AuthenticatorData:
         flags = (
-            AuthenticatorData.FLAG.USER_PRESENT | AuthenticatorData.FLAG.USER_VERIFIED
+            1 << 0  # User Present
+            | 1 << 2  # User Verified
         )
         if attested_credential_data:
-            flags |= AuthenticatorData.FLAG.ATTESTED
+            flags |= 1 << 6  # Attested credential data included
 
         rp_id_hash = sha256(rp_id.encode('utf-8')).digest()
         sig_counter = self._get_timestamp_signature_counter()
-        return AuthenticatorData.create(
-            rp_id_hash, flags, sig_counter, attested_credential_data or b''
+        return AuthenticatorData(
+            rp_id_hash=rp_id_hash,
+            flags=flags,
+            counter=sig_counter,
+            credential_data=attested_credential_data,
+            extensions=None
         )
 
     @staticmethod
@@ -263,20 +267,53 @@ class CtapKeyringDevice(ctap.CtapDevice):
 
     def get_assertion(self, get_assertion_request: dict) -> AssertionResponse:
         request = CtapGetAssertionRequest.create(get_assertion_request)
-        if request.user_verification_required:
-            self._verify_user(request.rp_id)
+        if not request.rp_id or not request.client_data_hash:
+            raise CtapError(CtapError.ERR.MISSING_PARAMETER)
 
-        creds = self._find_credentials(request.allow_list, request.rp_id)
-
-        if len(creds) == 0:
+        if not request.allow_list:
             raise CtapError(CtapError.ERR.NO_CREDENTIALS)
 
-        # Note: consecutive calls to get_assertion will override this context
+        credentials = self._find_credentials(request.allow_list, request.rp_id)
+        if not credentials:
+            raise CtapError(CtapError.ERR.NO_CREDENTIALS)
+
         self._next_assertions_ctx = CtapGetNextAssertionContext(
-            request=request, creds=creds, cred_counter=0
+            credentials=credentials[1:], rp_id=request.rp_id
         )
 
-        return self._get_assertion(request, self._next_assertions_ctx)
+        return self._get_assertion(request, credentials[0])
+
+    def _get_assertion(
+        self, request: CtapGetAssertionRequest, credential: Credential
+    ) -> AssertionResponse:
+        self._verify_user(request.rp_id)
+        authenticator_data = self._make_authenticator_data(request.rp_id, None)
+        signature = self._generate_signature(
+            authenticator_data, request.client_data_hash, credential.private_key
+        )
+
+        return AssertionResponse(
+            credential=credential.public_key_credential_descriptor,
+            auth_data=authenticator_data,
+            signature=signature,
+            user=credential.user,
+            number_of_credentials=len(self._next_assertions_ctx.credentials) + 1 if self._next_assertions_ctx else 1
+        )
+
+    def get_next_assertion(self) -> AssertionResponse:
+        if not self._next_assertions_ctx or not self._next_assertions_ctx.credentials:
+            raise CtapError(CtapError.ERR.NOT_ALLOWED)
+
+        credentials = self._next_assertions_ctx.credentials
+        rp_id = self._next_assertions_ctx.rp_id
+        self._next_assertions_ctx = CtapGetNextAssertionContext(
+            credentials=credentials[1:], rp_id=rp_id
+        )
+
+        return self._get_assertion(
+            CtapGetAssertionRequest(rp_id=rp_id, client_data_hash=b'', allow_list=[]),
+            credentials[0]
+        )
 
     @classmethod
     def _find_credentials(
@@ -327,39 +364,6 @@ class CtapKeyringDevice(ctap.CtapDevice):
     @classmethod
     def get_service_name(cls, rp_id: str) -> str:
         return '{rp_id}-webauthn'.format(rp_id=rp_id)
-
-    def get_next_assertion(self) -> AssertionResponse:
-        if not self._next_assertions_ctx:
-            raise CtapError(CtapError.ERR.NOT_ALLOWED)
-
-        return self._get_assertion(
-            self._next_assertions_ctx.request, self._next_assertions_ctx
-        )
-
-    def _get_assertion(
-        self, request: CtapGetAssertionRequest, ctx: CtapGetNextAssertionContext
-    ) -> AssertionResponse:
-        cred = ctx.get_next_cred()
-        authenticator_data = self._make_authenticator_data(
-            request.rp_id, attested_credential_data=None
-        )
-        signature = self._generate_signature(
-            authenticator_data, request.client_data_hash, cred.private_key
-        )
-        response = AssertionResponse(
-            PublicKeyCredentialDescriptor(
-                PublicKeyCredentialType.PUBLIC_KEY,
-                cred.id,
-                transports=[webauthn.AuthenticatorTransport.INTERNAL],
-            ).__dict__,
-            authenticator_data,
-            signature,
-            user=PublicKeyCredentialUserEntity(
-                name='', id=cred.user_id.encode('utf-8'), display_name=''
-            ).__dict__,
-            number_of_credentials=len(ctx.creds),
-        )
-        return response
 
     def _verify_user(self, rp_id: str):
         verified = self._user_verifier.verify_user(rp_id)
